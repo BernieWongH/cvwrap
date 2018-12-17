@@ -7,11 +7,11 @@
 #include <maya/MSelectionList.h>
 #include <algorithm>
 #include <cassert>
+#include <complex>
 #include <set>
 #include <queue>
 #include <utility>
 
-//#define NO_INTRINSICS
 #define NORMALIZATION_INDEX -1
 
 void StartProgress(const MString& title, unsigned int count) {
@@ -69,22 +69,23 @@ MStatus GetShapeNode(MDagPath& path, bool intermediate) {
   }
 
   if (path.hasFn(MFn::kTransform)) {
-    unsigned int shapeCount;
-    status = path.numberOfShapesDirectlyBelow(shapeCount);
-    CHECK_MSTATUS_AND_RETURN_IT(status);
+    unsigned int shapeCount = path.childCount();
 
     for (unsigned int i = 0; i < shapeCount; ++i) {
-      status = path.extendToShapeDirectlyBelow(i);
+      status = path.push(path.child(i));
       CHECK_MSTATUS_AND_RETURN_IT(status);
+      if (!IsShapeNode(path)) {
+        path.pop();
+        continue;
+      }
 
-      // Make sure it is not an intermediate object.
       MFnDagNode fnNode(path, &status);
       CHECK_MSTATUS_AND_RETURN_IT(status);
-      if ((!fnNode.isIntermediateObject() && !intermediate) || 
+      if ((!fnNode.isIntermediateObject() && !intermediate) ||
           (fnNode.isIntermediateObject() && intermediate)) {
         return MS::kSuccess;
       }
-      // Go to the next shape.
+      // Go to the next shape
       path.pop();
     }
   }
@@ -104,33 +105,16 @@ MStatus GetDagPath(MString& name, MDagPath& path) {
   return MS::kSuccess;
 }
 
-
 MStatus DeleteIntermediateObjects(MDagPath& path) {
   MStatus status;
-  if (IsShapeNode(path)) {
-    path.pop();
-  }
-  if (path.hasFn(MFn::kTransform)) {
-    unsigned int shapeCount;
-    status = path.numberOfShapesDirectlyBelow(shapeCount);
+  MDagPath pathMesh(path);
+  while (GetShapeNode(pathMesh, true) == MS::kSuccess) {
+    status = MGlobal::executeCommand("delete " + pathMesh.partialPathName());
     CHECK_MSTATUS_AND_RETURN_IT(status);
-
-    for (unsigned int i = 0; i < shapeCount; ++i) {
-      status = path.extendToShapeDirectlyBelow(i);
-      CHECK_MSTATUS_AND_RETURN_IT(status);
-
-      MFnDagNode fnNode(path, &status);
-      CHECK_MSTATUS_AND_RETURN_IT(status);
-      path.pop();
-      if (fnNode.isIntermediateObject()) {
-        status = MGlobal::executeCommand("delete " + fnNode.partialPathName());
-        CHECK_MSTATUS_AND_RETURN_IT(status);
-      }
-    }
+    pathMesh = MDagPath(path);
   }
   return MS::kSuccess;
 }
-
 
 void GetBarycentricCoordinates(const MPoint& P, const MPoint& A, const MPoint& B, const MPoint& C,
                                BaryCoords& coords) {
@@ -217,7 +201,6 @@ MStatus CrawlSurface(const MPoint& startPoint, const MIntArray& vertexIndices, M
     if (distance <= maxDistance) {
       CrawlData root = {startPoint, distance, vertexIndices[i]};
       verticesToVisit.push(root);
-      distances[vertexIndices[i]] = distance;
     }
     // Track the minimum start distance in case we need to add the closest vertex below.
     // The minimum must be greater than 0 to make sure we do not use the vertex that is the
@@ -230,7 +213,7 @@ MStatus CrawlSurface(const MPoint& startPoint, const MIntArray& vertexIndices, M
   // If we didn't even reach a vertex in the hit face, or the startPoint is equal to a vertex
   // on the face, add the closest vertex so we can calculate a proper up vector
   if (verticesToVisit.size() <= 1) {
-    CrawlData root = {startPoint, maxDistance - 0.001, minStartIndex};
+    CrawlData root = {startPoint, maxDistance - 0.001, (int)minStartIndex};
     verticesToVisit.push(root);
     distances[minStartIndex] = maxDistance - 0.001;
   }
@@ -291,8 +274,10 @@ void CalculateSampleWeights(const std::map<int, double>& distances, double radiu
 
   // Make the samples a multiple of 4 so we can use fast intrinsics!
   int remainder = 4 - ((samples.size()-1) % 4);
-  for (int i = 0; i < remainder; ++i) {
-    samples.push_back(std::pair<int, double>(0, 0.0));
+  if (remainder != 4) {
+    for (int i = 0; i < remainder; ++i) {
+      samples.push_back(std::pair<int, double>(0, 0.0));
+    }
   }
 
   unsigned int length = (unsigned int)samples.size();
@@ -320,7 +305,10 @@ void CreateMatrix(const MPoint& origin, const MVector& normal, const MVector& up
   const MPoint& t = origin;
   const MVector& y = normal;
   MVector x = y ^ up;
-  MVector z = y ^ x;
+  MVector z = x ^ y;
+  // Renormalize vectors
+  x.normalize();
+  z.normalize();
   matrix[0][0] = x.x; matrix[0][1] = x.y; matrix[0][2] = x.z; matrix[0][3] = 0.0;
   matrix[1][0] = y.x; matrix[1][1] = y.y; matrix[1][2] = y.z; matrix[1][3] = 0.0;
   matrix[2][0] = z.x; matrix[2][1] = z.y; matrix[2][2] = z.z; matrix[2][3] = 0.0;
@@ -335,29 +323,8 @@ void CalculateBasisComponents(const MDoubleArray& weights, const BaryCoords& coo
                               MPoint& origin, MVector& up, MVector& normal) {
   // Start with the recreated point and normal using the barycentric coordinates of the hit point.
   unsigned int hitIndex = weights.length()-1;
-#ifdef NO_INTRINSICS
-  MPoint hitPoint;
-  MVector hitNormal;
-  for (int i = 0; i < 3; ++i) {
-    hitPoint += points[triangleVertices[i]] * coords[i];
-    hitNormal += MVector(normals[triangleVertices[i]]) * coords[i];
-  }
-  // Create the barycentric point and normal.
-  origin = hitPoint * weights[hitIndex];
-  normal = hitNormal * weights[hitIndex];
-  // Then use the weighted adjacent data.
-  for (unsigned int j = 0; j < hitIndex; j++) {
-    origin += MVector(points[sampleIds[j]]) * weights[j];
-    normal += MVector(normals[sampleIds[j]]) * weights[j];
-  }
-
-  // Calculate the up vector
-  up = (hitPoint - origin) * weights[hitIndex];
-  for (unsigned int j = 0; j < hitIndex; j++) {
-    up += (points[sampleIds[j]] - origin) * weights[j];
-  }
-#else
-  __m256d hitPointV = Dot4<MPoint>(coords[0], coords[1], coords[2], 0.0,
+#ifdef __AVX__
+  __m256d originV = Dot4<MPoint>(coords[0], coords[1], coords[2], 0.0,
                                 points[triangleVertices[0]], points[triangleVertices[1]],
                                 points[triangleVertices[2]], MPoint::origin);
   __m256d hitNormalV = Dot4<MVector>(coords[0], coords[1], coords[2], 0.0,
@@ -365,22 +332,15 @@ void CalculateBasisComponents(const MDoubleArray& weights, const BaryCoords& coo
                                 normals[triangleVertices[2]], MVector::zero);
   __m256d hitWeightV = _mm256_set1_pd(weights[hitIndex]);
   // Create the barycentric point and normal.
-  __m256d originV = _mm256_mul_pd(hitPointV, hitWeightV);
   __m256d normalV = _mm256_mul_pd(hitNormalV, hitWeightV);
   // Then use the weighted adjacent data.
   for (unsigned int j = 0; j < hitIndex; j += 4) {
-    __m256d tempOrigin = Dot4<MPoint>(weights[j], weights[j+1], weights[j+2], weights[j+3],
-                                      points[sampleIds[j]], points[sampleIds[j+1]],
-                                      points[sampleIds[j+2]], points[sampleIds[j+3]]);
-    originV = _mm256_add_pd(tempOrigin, originV);
-
     __m256d tempNormal = Dot4<MVector>(weights[j], weights[j+1], weights[j+2], weights[j+3],
                                        normals[sampleIds[j]], normals[sampleIds[j+1]],
                                        normals[sampleIds[j+2]], normals[sampleIds[j+3]]);
     normalV = _mm256_add_pd(tempNormal, normalV);
   }
 
-  //double values[4];
   _mm256_store_pd(alignedStorage, originV);
   origin.x = alignedStorage[0];
   origin.y = alignedStorage[1];
@@ -391,23 +351,37 @@ void CalculateBasisComponents(const MDoubleArray& weights, const BaryCoords& coo
   normal.z = alignedStorage[2];
 
   // Calculate the up vector
-  __m256d upV = _mm256_mul_pd(_mm256_sub_pd(hitPointV, originV), hitWeightV);
-  MVector v1, v2, v3, v4;
-  for (unsigned int j = 0; j < hitIndex; j += 4) {
-    v1 = points[sampleIds[j]] - origin;
-    v2 = points[sampleIds[j+1]] - origin;
-    v3 = points[sampleIds[j+2]] - origin;
-    v4 = points[sampleIds[j+3]] - origin;
-    __m256d tempUp = Dot4<MVector>(weights[j], weights[j+1], weights[j+2], weights[j+3],
-                                   v1, v2, v3, v4);
-    upV = _mm256_add_pd(tempUp, upV);
-  }
+  const MPoint& pt1 = points[triangleVertices[0]];
+  const MPoint& pt2 = points[triangleVertices[1]];
+  __m256d p1 = _mm256_set_pd(pt1.w, pt1.z, pt1.y, pt1.x);
+  __m256d p2 = _mm256_set_pd(pt2.w, pt2.z, pt2.y, pt2.x);
+  p1 = _mm256_add_pd(p1, p2);
+  __m256d half = _mm256_set_pd(0.5, 0.5, 0.5, 0.5);
+  p1 = _mm256_mul_pd(p1, half);
+  __m256d upV = _mm256_sub_pd(p1, originV);
   _mm256_store_pd(alignedStorage, upV);
   up.x = alignedStorage[0];
   up.y = alignedStorage[1];
   up.z = alignedStorage[2];
-#endif
+#else
+  MVector hitNormal;
+  // Create the barycentric point and normal.
+  for (int i = 0; i < 3; ++i) {
+    origin += points[triangleVertices[i]] * coords[i];
+    hitNormal += MVector(normals[triangleVertices[i]]) * coords[i];
+  }
+  // Use crawl data to calculate normal
+  normal = hitNormal * weights[hitIndex];
+  for (unsigned int j = 0; j < hitIndex; j++) {
+    normal += MVector(normals[sampleIds[j]]) * weights[j];
+  }
 
+  // Calculate the up vector
+  // The triangle vertices are sorted by decreasing barycentric coordinates so the first two are
+  // the two closest vertices in the triangle.
+  up = ((points[triangleVertices[0]] + points[triangleVertices[1]]) * 0.5) - origin;
+#endif
+  normal.normalize();
   GetValidUp(weights, points, sampleIds, origin, normal, up);
 }
 
@@ -417,11 +391,11 @@ void GetValidUp(const MDoubleArray& weights, const MPointArray& points,
                 MVector& up) {
   MVector unitUp = up.normal();
   // Adjust up if it's parallel to normal or if it's zero length
-  if (abs((unitUp * normal) - 1.0) < 0.001 || up.length() < 0.0001) {
+  if (std::abs((unitUp * normal) - 1.0) < 0.001 || up.length() < 0.0001) {
     for (unsigned int j = 0; j < weights.length()-1; ++j) {
       up -= (points[sampleIds[j]] - origin) * weights[j];
       unitUp = up.normal();
-      if (abs((unitUp * normal) - 1.0) > 0.001 && up.length() > 0.0001) {
+      if (std::abs((unitUp * normal) - 1.0) > 0.001 && up.length() > 0.0001) {
         // If the up and normal vectors are no longer parallel and the up vector has a length,
         // then we are good to go.
         break;

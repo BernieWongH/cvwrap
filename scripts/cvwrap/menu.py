@@ -2,7 +2,10 @@ import maya.cmds as cmds
 import maya.mel as mel
 import maya.OpenMayaUI as OpenMayaUI
 import os
-from PySide import QtGui
+if cmds.about(api=True) >= 201700:
+    from PySide2 import QtGui
+else:
+    from PySide import QtGui
 import cvwrap.bindui
 
 NAME_WIDGET = 'cvwrap_name'
@@ -16,6 +19,9 @@ def create_menuitems():
     global MENU_ITEMS
     if MENU_ITEMS:
         # Already created
+        return
+    if cmds.about(api=True) < 201600:
+        cmds.warning('cvWrap menus only available in Maya 2016 and higher.')
         return
     for menu in ['mainDeformMenu', 'mainRigDeformationsMenu']:
         # Make sure the menu widgets exist first.
@@ -232,8 +238,7 @@ def paint_cvwrap_weights(*args, **kwargs):
     """Activates the paint cvWrap weights context."""
     sel = cmds.ls(sl=True)
     if sel:
-        wrap_nodes = [node for node in cmds.listHistory(sel[0], pdo=True)
-                     if cmds.nodeType(node) == 'cvWrap']
-        if wrap_nodes:
+        wrap_node = get_wrap_node_from_selected()
+        if wrap_node:
             mel.eval('artSetToolAndSelectAttr("artAttrCtx", "cvWrap.{0}.weights");'.format(
-                     wrap_nodes[0]))
+                     wrap_node))

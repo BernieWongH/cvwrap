@@ -1,10 +1,12 @@
 #ifndef CVWRAPDEFORMER_H
 #define CVWRAPDEFORMER_H
 
+#include <maya/MDGModifier.h>
 #include <maya/MFloatArray.h>
 #include <maya/MIntArray.h>
 #include <maya/MMatrix.h> 
 #include <maya/MMatrixArray.h> 
+#include <maya/MMessage.h>
 #include <maya/MPoint.h> 
 #include <maya/MThreadPool.h>
 #include <maya/MPxDeformerNode.h>
@@ -21,7 +23,6 @@
 #include "common.h"
 
 struct TaskData {
-  MMatrix driverMatrix;
   MMatrix drivenMatrix;
   MMatrix drivenInverseMatrix;
   float envelope;
@@ -45,6 +46,7 @@ class CVWrap : public MPxDeformerNode {
  public:
   CVWrap();
   virtual ~CVWrap(); 
+  virtual void postConstructor();
   virtual MStatus deform(MDataBlock& data, MItGeometry& iter, const MMatrix& mat,
                          unsigned int mIndex);
   virtual MStatus setDependentsDirty(const MPlug& plugBeingDirtied, MPlugArray& affectedPlugs);
@@ -65,7 +67,6 @@ class CVWrap : public MPxDeformerNode {
   static MObject aBindDriverGeo;
   static MObject aDriverGeo;
   static MObject aBindData;
-  static MObject aSampleVerts;
   static MObject aSampleComponents;
   static MObject aSampleWeights;
     /** The vertex indices of the triangle containing the origin of each coordinate system. */
@@ -79,10 +80,12 @@ class CVWrap : public MPxDeformerNode {
   static MTypeId id;
 
 private:
+  static void aboutToDeleteCB(MObject &node, MDGModifier &modifier, void *clientData);
+
   std::map<unsigned int, bool> dirty_;
   std::vector<TaskData> taskData_;  /**< Per geometry evaluation data. */
   std::vector<ThreadData<TaskData>*> threadData_;
-
+  MCallbackId onDeleteCallbackId;
 };
 
 
@@ -97,11 +100,16 @@ class CVWrapGPU : public MPxGPUDeformer {
 	CVWrapGPU();
 	virtual ~CVWrapGPU();
 
-	
+#if MAYA_API_VERSION <= 201700
 	virtual MPxGPUDeformer::DeformerStatus evaluate(MDataBlock& block, const MEvaluationNode&,
                                                   const MPlug& plug, unsigned int numElements,
                                                   const MAutoCLMem, const MAutoCLEvent,
                                                   MAutoCLMem, MAutoCLEvent&);
+#else
+	virtual MPxGPUDeformer::DeformerStatus evaluate(MDataBlock& block, const MEvaluationNode& evaluationNode,
+													const MPlug& plug, const MGPUDeformerData& inputData,
+													MGPUDeformerData& outputData);
+#endif
 	virtual void terminate();
 
 	static MGPUDeformerRegistrationInfo* GetGPUDeformerInfo();
@@ -147,10 +155,24 @@ class CVWrapGPUDeformerInfo : public MGPUDeformerRegistrationInfo {
 		return new CVWrapGPU();
 	}
 	
-	virtual bool validateNode(MDataBlock& block, const MEvaluationNode& evaluationNode,
+
+
+#if MAYA_API_VERSION >= 201650
+	virtual bool validateNodeInGraph(MDataBlock& block, const MEvaluationNode& evaluationNode,
+                                   const MPlug& plug, MStringArray* messages)	{
+		return true;
+	}
+
+	virtual bool validateNodeValues(MDataBlock& block, const MEvaluationNode& evaluationNode,
+                                  const MPlug& plug, MStringArray* messages) {
+		return true;
+	}
+#else
+  virtual bool validateNode(MDataBlock& block, const MEvaluationNode& evaluationNode,
                             const MPlug& plug, MStringArray* messages) {
 		return true;
 	}
+#endif
 };
 
 #endif // End Maya 2016

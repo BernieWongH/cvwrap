@@ -9,6 +9,8 @@
 #include <maya/MFnTypedAttribute.h>
 #include <maya/MGlobal.h>
 #include <maya/MItGeometry.h>
+#include <maya/MNodeMessage.h>
+#include <maya/MPlugArray.h>
 #include <cassert>
 
 MTypeId CVWrap::id(0x0011580B);
@@ -17,7 +19,6 @@ const char* CVWrap::kName = "cvWrap";
 MObject CVWrap::aBindDriverGeo;
 MObject CVWrap::aDriverGeo;
 MObject CVWrap::aBindData;
-MObject CVWrap::aSampleVerts;
 MObject CVWrap::aSampleComponents;
 MObject CVWrap::aSampleWeights;
 MObject CVWrap::aTriangleVerts;
@@ -213,9 +214,13 @@ MStatus GetDriverData(MDataBlock& data, TaskData& taskData) {
 
 CVWrap::CVWrap() {
   MThreadPool::init();
+  onDeleteCallbackId = 0;
 }
 
 CVWrap::~CVWrap() {
+  if (onDeleteCallbackId != 0)
+    MMessage::removeCallback(onDeleteCallbackId);
+	
   MThreadPool::release();
   std::vector<ThreadData<TaskData>*>::iterator iter;
   for (iter = threadData_.begin(); iter != threadData_.end(); ++iter) {
@@ -226,6 +231,27 @@ CVWrap::~CVWrap() {
 
 
 void* CVWrap::creator() { return new CVWrap(); }
+
+void CVWrap::postConstructor()
+{
+  MPxDeformerNode::postConstructor();
+
+  MStatus status = MS::kSuccess;
+  MObject obj = thisMObject();
+  onDeleteCallbackId = MNodeMessage::addNodeAboutToDeleteCallback(obj, aboutToDeleteCB, NULL, &status);
+}
+
+void CVWrap::aboutToDeleteCB(MObject &node, MDGModifier &modifier, void *clientData)
+{
+  // Find any node connected to .bindMesh and delete it with the deformer, for compatibility with wrap.
+  MPlug bindPlug(node, aBindDriverGeo);
+  MPlugArray bindGeometries;
+  bindPlug.connectedTo(bindGeometries, true, false);
+  for (unsigned int i = 0; i < bindGeometries.length(); i++) {
+    MObject node = bindGeometries[i].node();
+    modifier.deleteNode(node);
+  }
+}
 
 
 MStatus CVWrap::setDependentsDirty(const MPlug& plugBeingDirtied, MPlugArray& affectedPlugs) {
@@ -346,6 +372,7 @@ void CVWrap::CreateTasks(void *data, MThreadRootTask *pRoot) {
 
 MThreadRetVal CVWrap::EvaluateWrap(void *pParam) {
   ThreadData<TaskData>* pThreadData = static_cast<ThreadData<TaskData>*>(pParam);
+  double*& alignedStorage = pThreadData->alignedStorage;
   TaskData* pData = pThreadData->pData;
   // Get the data out of the struct so it is easier to work with.
   MMatrix& drivenMatrix = pData->drivenMatrix;
@@ -371,7 +398,6 @@ MThreadRetVal CVWrap::EvaluateWrap(void *pParam) {
   scaleMatrix[0][0] = scale;
   scaleMatrix[1][1] = scale;
   scaleMatrix[2][2] = scale;
-  double* alignedStorage = (double*) _mm_malloc (4*sizeof(double),256);
   for (unsigned int i = taskStart; i < taskEnd; ++i) {
     if (i >= points.length()) {
       break;
@@ -389,7 +415,6 @@ MThreadRetVal CVWrap::EvaluateWrap(void *pParam) {
     MPoint newPt = ((points[i]  * drivenMatrix) * (bindMatrices[index] * matrix)) * drivenInverseMatrix;
     points[i] = points[i] + ((newPt - points[i]) * paintWeights[i] * env);
   }
-  _mm_free(alignedStorage);
   return 0;
 }
 
@@ -397,6 +422,11 @@ MThreadRetVal CVWrap::EvaluateWrap(void *pParam) {
 #if MAYA_API_VERSION >= 201600
 MString CVWrapGPU::pluginLoadPath;
 
+#if MAYA_API_VERSION >= 201650
+cl_command_queue (*getMayaDefaultOpenCLCommandQueue)() = MOpenCLInfo::getMayaDefaultOpenCLCommandQueue;
+#else
+cl_command_queue (*getMayaDefaultOpenCLCommandQueue)() = MOpenCLInfo::getOpenCLCommandQueue;
+#endif
 /**
   Convenience function to copy array data to the gpu.
 */
@@ -409,7 +439,7 @@ cl_int EnqueueBuffer(MAutoCLMem& mclMem, size_t bufferSize, void* data) {
                                         bufferSize, data, &err));
 	}	else {
 		// The buffer already exists so just copy the data over.
-		err = clEnqueueWriteBuffer(MOpenCLInfo::getOpenCLCommandQueue(),
+		err = clEnqueueWriteBuffer(getMayaDefaultOpenCLCommandQueue(),
                                mclMem.get(), CL_TRUE, 0, bufferSize,
                                data, 0, NULL, NULL);
 	}
@@ -430,7 +460,7 @@ CVWrapGPU::~CVWrapGPU() {
   terminate();
 }
 
-
+#if MAYA_API_VERSION <= 201700
 MPxGPUDeformer::DeformerStatus CVWrapGPU::evaluate(MDataBlock& block,
                                                    const MEvaluationNode& evaluationNode,
                                                    const MPlug& plug,
@@ -439,6 +469,24 @@ MPxGPUDeformer::DeformerStatus CVWrapGPU::evaluate(MDataBlock& block,
                                                    const MAutoCLEvent inputEvent,
                                                    MAutoCLMem outputBuffer,
                                                    MAutoCLEvent& outputEvent) {
+#else
+MPxGPUDeformer::DeformerStatus  CVWrapGPU::evaluate(MDataBlock& block,
+													const MEvaluationNode& evaluationNode,
+													const MPlug& plug,
+													const MGPUDeformerData& inputData,
+													MGPUDeformerData& outputData) {
+	// get the input GPU data and event
+	MGPUDeformerBuffer inputDeformerBuffer = inputData.getBuffer(sPositionsName());
+	const MAutoCLMem inputBuffer = inputDeformerBuffer.buffer();
+	unsigned int numElements = inputDeformerBuffer.elementCount();
+	const MAutoCLEvent inputEvent = inputDeformerBuffer.bufferReadyEvent();
+
+	// create the output buffer
+	MGPUDeformerBuffer outputDeformerBuffer = createOutputBuffer(inputDeformerBuffer);
+	MAutoCLEvent outputEvent;
+	MAutoCLMem outputBuffer = outputDeformerBuffer.buffer();
+#endif
+
   MStatus status;
   numElements_ = numElements;
   // Copy all necessary data to the gpu.
@@ -452,10 +500,14 @@ MPxGPUDeformer::DeformerStatus CVWrapGPU::evaluate(MDataBlock& block,
   if (!kernel_.get())  {
     // Load the OpenCL kernel if we haven't yet.
     MString openCLKernelFile(pluginLoadPath);
-    openCLKernelFile += "/cvwrap.cl";
+#if MAYA_API_VERSION > 201700
+	openCLKernelFile += "/cvwrap.cl";
+#else
+    openCLKernelFile += "/cvwrap_pre2018.cl";
+#endif
     kernel_ = MOpenCLInfo::getOpenCLKernel(openCLKernelFile, "cvwrap");
     if (kernel_.isNull())  {
-      std::cerr << "Could not compile kernel " << openCLKernelFile << "\n";
+      std::cerr << "Could not compile kernel " << openCLKernelFile.asChar() << "\n";
       return MPxGPUDeformer::kDeformerFailure;
     }
   }
@@ -492,6 +544,18 @@ MPxGPUDeformer::DeformerStatus CVWrapGPU::evaluate(MDataBlock& block,
   MOpenCLInfo::checkCLErrorStatus(err);
   err = clSetKernelArg(kernel_.get(), parameterId++, sizeof(cl_mem), (void*)drivenMatrices_.getReadOnlyRef());
   MOpenCLInfo::checkCLErrorStatus(err);
+#if MAYA_API_VERSION > 201700
+  // get the world space and inverse world space matrix mem handles
+  MGPUDeformerBuffer inputWorldSpaceMatrixDeformerBuffer = inputData.getBuffer(sGeometryMatrixName());
+  const MAutoCLMem deformerWorldSpaceMatrix = inputWorldSpaceMatrixDeformerBuffer.buffer();
+  MGPUDeformerBuffer inputInvWorldSpaceMatrixDeformerBuffer = inputData.getBuffer(sInverseGeometryMatrixName());
+  const MAutoCLMem deformerInvWorldSpaceMatrix = inputInvWorldSpaceMatrixDeformerBuffer.buffer();
+  // Note: these matrices are in row major order
+  err = clSetKernelArg(kernel_.get(), parameterId++, sizeof(cl_mem), (void*)deformerWorldSpaceMatrix.getReadOnlyRef());
+  MOpenCLInfo::checkCLErrorStatus(err);
+  err = clSetKernelArg(kernel_.get(), parameterId++, sizeof(cl_mem), (void*)deformerInvWorldSpaceMatrix.getReadOnlyRef());
+  MOpenCLInfo::checkCLErrorStatus(err);
+#endif
   err = clSetKernelArg(kernel_.get(), parameterId++, sizeof(cl_float), (void*)&envelope);
   MOpenCLInfo::checkCLErrorStatus(err);
   err = clSetKernelArg(kernel_.get(), parameterId++, sizeof(cl_uint), (void*)&numElements_);
@@ -525,7 +589,7 @@ MPxGPUDeformer::DeformerStatus CVWrapGPU::evaluate(MDataBlock& block,
 
   // run the kernel
   err = clEnqueueNDRangeKernel(
-    MOpenCLInfo::getOpenCLCommandQueue(),
+    getMayaDefaultOpenCLCommandQueue(),
     kernel_.get(),
     1,
     NULL,
@@ -536,6 +600,12 @@ MPxGPUDeformer::DeformerStatus CVWrapGPU::evaluate(MDataBlock& block,
     outputEvent.getReferenceForAssignment() );
   MOpenCLInfo::checkCLErrorStatus(err);
 
+#if MAYA_API_VERSION > 201700
+  // set the buffer into the output data
+  outputDeformerBuffer.setBufferReadyEvent(outputEvent);
+  outputData.setBuffer(outputDeformerBuffer);
+#endif
+
   return MPxGPUDeformer::kDeformerSuccess;
 }
 
@@ -544,10 +614,9 @@ MStatus CVWrapGPU::EnqueueBindData(MDataBlock& data, const MEvaluationNode& eval
   MStatus status;
 	if ((bindMatrices_.get() && (
         !evaluationNode.dirtyPlugExists(CVWrap::aBindData, &status) &&
-        !evaluationNode.dirtyPlugExists(CVWrap::aSampleVerts, &status) &&
         !evaluationNode.dirtyPlugExists(CVWrap::aSampleComponents, &status) &&
         !evaluationNode.dirtyPlugExists(CVWrap::aSampleWeights, &status) &&
-        !evaluationNode.dirtyPlugExists(CVWrap::aSampleVerts, &status) &&
+        !evaluationNode.dirtyPlugExists(CVWrap::aTriangleVerts, &status) &&
         !evaluationNode.dirtyPlugExists(CVWrap::aBarycentricWeights, &status) &&
         !evaluationNode.dirtyPlugExists(CVWrap::aBindMatrix, &status)
       )) || !status) {
@@ -653,6 +722,8 @@ MStatus CVWrapGPU::EnqueueDriverData(MDataBlock& data, const MEvaluationNode& ev
   err = EnqueueBuffer(driverNormals_, pointCount * 3 * sizeof(float), (void*)driverData);
 	delete [] driverData;
 
+  int idx = 0;
+#if MAYA_API_VERSION <= 201700
   // Store the driven matrices on the gpu.
   MArrayDataHandle hInputs = data.inputValue(CVWrap::input, &status);
   unsigned int geomIndex = plug.logicalIndex();
@@ -663,8 +734,8 @@ MStatus CVWrapGPU::EnqueueDriverData(MDataBlock& data, const MEvaluationNode& ev
   MDataHandle hGeom = hInput.child(CVWrap::inputGeom);
   MMatrix localToWorldMatrix = hGeom.geometryTransformMatrix();
   MMatrix worldToLocalMatrix = localToWorldMatrix.inverse();
-	float drivenMatrices[48]; // 0-15: localToWorld, 16-31: worldToLocal, 32-47: scale
-  int idx = 0;
+  float drivenMatrices[48]; // 0-15: localToWorld, 16-31: worldToLocal, 32-47: scale
+
   // Store in column order so we can dot in the cl kernel.
   for(unsigned int column = 0; column < 4; column++) {
     for(unsigned int row = 0; row < 4; row++) {
@@ -676,6 +747,9 @@ MStatus CVWrapGPU::EnqueueDriverData(MDataBlock& data, const MEvaluationNode& ev
 			drivenMatrices[idx++] = (float)worldToLocalMatrix(row, column);
     }
 	}
+#else
+	float drivenMatrices[16]; // 0-15: scale
+#endif
   // Scale matrix is stored row major
   float scale = data.inputValue(CVWrap::aScale, &status).asFloat();
   CHECK_MSTATUS_AND_RETURN_IT(status);
@@ -688,7 +762,11 @@ MStatus CVWrapGPU::EnqueueDriverData(MDataBlock& data, const MEvaluationNode& ev
 			drivenMatrices[idx++] = (float)scaleMatrix(row, column);
     }
 	}
+#if MAYA_API_VERSION <= 201700
   err = EnqueueBuffer(drivenMatrices_, 48 * sizeof(float), (void*)drivenMatrices);
+#else
+  err = EnqueueBuffer(drivenMatrices_, 16 * sizeof(float), (void*)drivenMatrices);
+#endif
   return MS::kSuccess;
 }
 

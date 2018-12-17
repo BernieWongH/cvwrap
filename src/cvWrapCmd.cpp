@@ -1,6 +1,6 @@
 #include "cvWrapCmd.h"
 #include "cvWrapDeformer.h"
-#include "bindingexporter.h"
+#include "bindingio.h"
 
 #include <maya/MArgDatabase.h>
 #include <maya/MFnDoubleArrayData.h>
@@ -15,7 +15,9 @@
 #include <maya/MFnSingleIndexedComponent.h>
 #include <maya/MFnWeightGeometryFilter.h>
 #include <maya/MSyntax.h>
+#include <algorithm>
 #include <cassert>
+#include <utility>
 
 #define PROGRESS_STEP 100
 #define TASK_COUNT 32
@@ -230,7 +232,7 @@ MStatus CVWrapCmd::redoIt() {
       MGlobal::displayInfo("Unable to open file for importing.");
       CHECK_MSTATUS_AND_RETURN_IT(MS::kFailure);
     }
-    BindingExporter exporter;
+    BindingIO exporter;
     status = exporter.ImportBinding(in, oWrapNode_);
     in.close();
     CHECK_MSTATUS_AND_RETURN_IT(status);
@@ -241,7 +243,7 @@ MStatus CVWrapCmd::redoIt() {
       MGlobal::displayError("Unable to open file for writing.");
       return MS::kFailure;
     }
-    BindingExporter exporter;
+    BindingIO exporter;
     status = exporter.ExportBinding(out, oWrapNode_);
     out.close();
     CHECK_MSTATUS_AND_RETURN_IT(status);
@@ -287,6 +289,8 @@ MStatus CVWrapCmd::CreateWrapDeformer() {
     status = CreateBindMesh(pathBindMesh);
     CHECK_MSTATUS_AND_RETURN_IT(status);
   }
+  status = ConnectBindMesh(pathBindMesh);
+  CHECK_MSTATUS_AND_RETURN_IT(status);
 
   if (useBinding_) {
     // Import a pre-existing binding.
@@ -295,7 +299,7 @@ MStatus CVWrapCmd::CreateWrapDeformer() {
       MGlobal::displayInfo("Unable to open file for importing.");
       CHECK_MSTATUS_AND_RETURN_IT(MS::kFailure);
     }
-    BindingExporter exporter;
+    BindingIO exporter;
     status = exporter.ImportBinding(in, oWrapNode_);
     in.close();
     CHECK_MSTATUS_AND_RETURN_IT(status);
@@ -376,11 +380,18 @@ MStatus CVWrapCmd::CreateBindMesh(MDagPath& pathBindMesh) {
   status = plug.setBool(false);
   CHECK_MSTATUS_AND_RETURN_IT(status);
   
+  return MS::kSuccess;
+}
+
+
+MStatus CVWrapCmd::ConnectBindMesh(MDagPath& pathBindMesh) {
+  MStatus status;
   // Connect the bind mesh to the wrap node
   status = GetShapeNode(pathBindMesh);
   CHECK_MSTATUS_AND_RETURN_IT(status);
   MFnDagNode fnBindMeshShape(pathBindMesh, &status);
-  MPlug plugBindMessage = fnBindMeshShape.findPlug("message", false, &status);   
+  CHECK_MSTATUS_AND_RETURN_IT(status);
+  MPlug plugBindMessage = fnBindMeshShape.findPlug("message", false, &status);
   CHECK_MSTATUS_AND_RETURN_IT(status);
   MPlug plugBindMesh(oWrapNode_, CVWrap::aBindDriverGeo);
   MDGModifier dgMod;
@@ -448,9 +459,14 @@ MStatus CVWrapCmd::CalculateBinding(MDagPath& pathBindMesh, BindData& bindData,
     MPlug plugBarycentricWeights = plugBind.child(CVWrap::aBarycentricWeights, &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
 
-    // TODO: Use the intermediate object for the binding.  This assumes the intermediate object
+    // Use the intermediate object for the binding.  This assumes the intermediate object
     // has the same component count as the displayed shape.
-    MItGeometry itGeo(pathDriven_[geomIndex], drivenComponents_[geomIndex], &status);
+    MDagPath pathDriven(pathDriven_[geomIndex]);
+    status = GetShapeNode(pathDriven, true);
+    if (MFAIL(status)) {
+      pathDriven = pathDriven_[geomIndex];
+    }
+    MItGeometry itGeo(pathDriven, drivenComponents_[geomIndex], &status);
     CHECK_MSTATUS_AND_RETURN_IT(status);
     int geoCount = itGeo.count();
 
@@ -545,9 +561,14 @@ void CVWrapCmd::CreateTasks(void *data, MThreadRootTask *pRoot) {
   }
 }
 
+bool SortCoords(std::pair<int, float> lhs, std::pair<int, float> rhs) {
+  return (lhs.second > rhs.second); 
+}
+
 
 MThreadRetVal CVWrapCmd::CalculateBindingTask(void *pParam) {
   ThreadData<BindData>* pThreadData = static_cast<ThreadData<BindData>*>(pParam);
+  double*& alignedStorage = pThreadData->alignedStorage;
   BindData* pData = pThreadData->pData;
   MMeshIntersector& intersector = pData->intersector;
   MMeshIntersector& subsetIntersector = pData->subsetIntersector;
@@ -572,7 +593,7 @@ MThreadRetVal CVWrapCmd::CalculateBindingTask(void *pParam) {
 
   // Pre-allocate the aligned storage for intrinsics calculation so we are not dynamically allocating
   // memory in the loop.
-  double* alignedStorage = (double*) _mm_malloc (4*sizeof(double),256);
+  std::vector<std::pair<int, float> > sortedCoords(3);
   for (unsigned int i = taskStart; i < taskEnd; ++i) {
     if (i >= inputPoints.length()) {
       break;
@@ -604,6 +625,16 @@ MThreadRetVal CVWrapCmd::CalculateBindingTask(void *pParam) {
                               driverPoints[triangleVertices[i][2]],
                               coords[i]);
 
+    // Sort coords highest to lowest so we can easility calculate the up vector
+    for (int j = 0; j < 3; ++j) {
+      sortedCoords[j] = std::pair<int, float>(triangleVertices[i][j], coords[i][j]);
+    }
+    std::sort(sortedCoords.begin(), sortedCoords.end(), SortCoords);
+    for (int j = 0; j < 3; ++j) {
+      triangleVertices[i][j] = sortedCoords[j].first;
+      coords[i][j] = sortedCoords[j].second;
+    }
+
     // Get vertices of closest face so we can crawl out from them.
     MIntArray& vertexList = perFaceVertices[faceId];
 
@@ -623,7 +654,6 @@ MThreadRetVal CVWrapCmd::CalculateBindingTask(void *pParam) {
     CreateMatrix(origin, normal, up, bindMatrices[i]);
     bindMatrices[i] = bindMatrices[i].inverse();
   }
-  _mm_free(alignedStorage);
   return 0;
 }
 
@@ -636,7 +666,9 @@ MStatus CVWrapCmd::GetExistingBindMesh(MDagPath &pathBindMesh) {
   
   // We'll find the bind mesh associated with the driver mesh by traversing the mesh connections
   // through the cvWrap node.
-  MPlug plugOutGeom = fnDriver.findPlug("outMesh", false, &status);
+  MPlug plugOutGeom = fnDriver.findPlug("worldMesh", false, &status);
+  CHECK_MSTATUS_AND_RETURN_IT(status);
+  status = plugOutGeom.selectAncestorLogicalIndex(0, plugOutGeom.attribute());
   CHECK_MSTATUS_AND_RETURN_IT(status);
   MPlugArray geomPlugs;
   plugOutGeom.connectedTo(geomPlugs, false, true);
@@ -645,20 +677,9 @@ MStatus CVWrapCmd::GetExistingBindMesh(MDagPath &pathBindMesh) {
     MObject oThisNode = geomPlugs[i].node();
     MFnDependencyNode fnNode(oThisNode);
     if (fnNode.typeId() == CVWrap::id) {
-      // Get bind wrap mesh from wrap node
-      MPlug plugBindWrapMesh = fnNode.findPlug(CVWrap::aBindDriverGeo, false, &status);
+      status = GetBindMesh(oThisNode, pathBindMesh);
       CHECK_MSTATUS_AND_RETURN_IT(status);
-      MPlugArray bindPlugs;
-      plugBindWrapMesh.connectedTo(bindPlugs, true, false);
-      if (bindPlugs.length() > 0) {
-        // If a bind mesh is connected, use it!
-        MObject oBindMesh = bindPlugs[0].node();
-        MFnDagNode fnBindDag(oBindMesh, &status);
-        CHECK_MSTATUS_AND_RETURN_IT(status);
-        status = fnBindDag.getPath(pathBindMesh);
-        CHECK_MSTATUS_AND_RETURN_IT(status);
-        return MS::kSuccess;
-      }
+      return MS::kSuccess;
     }
   }
   return MS::kSuccess;
@@ -680,7 +701,7 @@ MStatus CVWrapCmd::Rebind() {
   CHECK_MSTATUS_AND_RETURN_IT(status);
 
   MDagPath pathBindMesh;
-  status = GetBindMesh(pathBindMesh);
+  status = GetBindMesh(oWrapNode_, pathBindMesh);
   CHECK_MSTATUS_AND_RETURN_IT(status);
 
   status = CalculateBinding(pathBindMesh, bindData, dgMod_);
@@ -695,10 +716,10 @@ MStatus CVWrapCmd::Rebind() {
 }
 
 
-MStatus CVWrapCmd::GetBindMesh(MDagPath& pathBindMesh) {
+MStatus CVWrapCmd::GetBindMesh(MObject& oWrapNode, MDagPath& pathBindMesh) {
   MStatus status;
   // Get the bind mesh connected to the message attribute of the wrap deformer
-  MPlug plugBindMesh(oWrapNode_, CVWrap::aBindDriverGeo);
+  MPlug plugBindMesh(oWrapNode, CVWrap::aBindDriverGeo);
   MPlugArray plugs;
   plugBindMesh.connectedTo(plugs, true, false, &status);
   CHECK_MSTATUS_AND_RETURN_IT(status);
@@ -719,7 +740,7 @@ MStatus CVWrapCmd::CreateRebindSubsetMesh(MDagPath& pathDriverSubset) {
   MStatus status;
 
   MDagPath pathBindMesh;
-  status = GetBindMesh(pathBindMesh);
+  status = GetBindMesh(oWrapNode_, pathBindMesh);
   CHECK_MSTATUS_AND_RETURN_IT(status);
   MFnMesh fnBindMesh(pathBindMesh);
 
